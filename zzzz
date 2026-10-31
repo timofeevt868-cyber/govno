@@ -36,7 +36,7 @@ if not _install_missing():
 import os
 
 BOT_TOKEN   = "9160621259:AAHuevWDJsRKx-25qUs_lf1cVF0wkfbR-QQ"  # ← @BotFather → /newbot → скопируй токен
-ADMIN_ID    = 8769232009   # ← твой Telegram ID (напиши @userinfobot — он ответит числом)
+ADMIN_ID    =  8769232009   # ← твой Telegram ID (напиши @userinfobot — он ответит числом)
 
 STARS_PRICE = 69    # цена подписки в Telegram Stars
 TRIAL_DAYS  = 10    # дней пробного периода
@@ -114,6 +114,10 @@ async def db_init():
             date        TIMESTAMP,
             cached_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(owner_id, chat_id, message_id)
+        );
+        CREATE TABLE IF NOT EXISTS banned (
+            user_id   INTEGER PRIMARY KEY,
+            banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS business_connections (
             bc_id    TEXT PRIMARY KEY,
@@ -330,32 +334,35 @@ async def db_del_cached(owner_id: int, chat_id: int, msg_id: int):
         (owner_id, chat_id, msg_id))
     await _db.commit()
 
-async def db_get_chat_history(owner_id: int, chat_id: int) -> list[dict]:
-    """Все кешированные сообщения чата (в рамках владельца) по порядку."""
-    async with _db.execute(
-        "SELECT * FROM message_cache WHERE owner_id=? AND chat_id=? ORDER BY date ASC",
-        (owner_id, chat_id)
-    ) as c:
-        rows = await c.fetchall()
-    result = []
-    for r in rows:
-        d = dict(r)
-        d["date"] = _dt(d.get("date")) or datetime.utcnow()
-        result.append(d)
-    return result
 
-async def db_get_cached_chats(owner_id: int) -> list[dict]:
-    """Все уникальные чаты в кеше конкретного владельца (для меню восстановления)."""
+# ── админ: бан, отзыв подписки, списки ─────────────────────
+
+async def db_is_banned(user_id: int) -> bool:
+    async with _db.execute("SELECT 1 FROM banned WHERE user_id=?", (user_id,)) as c:
+        return await c.fetchone() is not None
+
+async def db_set_ban(user_id: int, banned: bool):
+    if banned:
+        await _db.execute("INSERT OR IGNORE INTO banned(user_id) VALUES(?)", (user_id,))
+    else:
+        await _db.execute("DELETE FROM banned WHERE user_id=?", (user_id,))
+    await _db.commit()
+
+async def db_revoke_sub(user_id: int):
+    await _db.execute("UPDATE users SET sub_until=NULL, trial_start=NULL WHERE user_id=?", (user_id,))
+    await _db.commit()
+
+async def db_top_referrers(limit: int = 10) -> list[dict]:
     async with _db.execute(
-        """SELECT chat_id, chat_title, COUNT(*) as msg_count, MAX(date) as last_date
-           FROM message_cache
-           WHERE owner_id=?
-           GROUP BY chat_id
-           ORDER BY last_date DESC""",
-        (owner_id,)
-    ) as c:
-        rows = await c.fetchall()
-    return [dict(r) for r in rows]
+        """SELECT r.inviter_id AS user_id, COUNT(*) AS cnt, u.name AS name
+           FROM referrals r LEFT JOIN users u ON u.user_id = r.inviter_id
+           GROUP BY r.inviter_id ORDER BY cnt DESC LIMIT ?""", (limit,)) as c:
+        return [dict(r) for r in await c.fetchall()]
+
+async def db_recent_users(limit: int = 10) -> list[dict]:
+    async with _db.execute(
+        "SELECT user_id, name, created_at FROM users ORDER BY created_at DESC LIMIT ?", (limit,)) as c:
+        return [dict(r) for r in await c.fetchall()]
 
 # ── stats ──────────────────────────────────────────────────
 
@@ -380,6 +387,8 @@ async def db_stats() -> dict:
 # ══════════════════════════════════════════════════════════
 
 async def is_subscribed(user_id: int) -> bool:
+    if await db_is_banned(user_id):
+        return False
     u = await db_get_user(user_id)
     if not u: return False
     if u.get("sub_until"):
@@ -399,7 +408,6 @@ def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Мои чаты",              callback_data="my_chats")],
         [InlineKeyboardButton(text="👤 Профиль / Подписка",    callback_data="profile")],
-        [InlineKeyboardButton(text="🔄 Восстановить переписку", callback_data="restore_menu")],
         [InlineKeyboardButton(text="👥 Реферальная программа", callback_data="referral")],
         [InlineKeyboardButton(text="❓ Как это работает",       callback_data="howto")],
     ])
@@ -475,6 +483,9 @@ router = Router(name="spybot")
 async def cmd_start(message: Message, bot: Bot):
     user_id = message.from_user.id
     name    = message.from_user.full_name
+    if await db_is_banned(user_id):
+        await message.answer("🚫 Доступ к боту ограничен администратором.")
+        return
     await db_get_or_create(user_id, name)
 
     # Обработка реферальной ссылки: /start ref_12345
@@ -611,121 +622,6 @@ async def cb_referral(call: CallbackQuery, bot: Bot):
     )
     await call.answer()
 
-# ── восстановление переписки ───────────────────────────────
-
-@router.callback_query(F.data == "restore_menu")
-async def cb_restore_menu(call: CallbackQuery):
-    if not await is_subscribed(call.from_user.id):
-        await call.answer("❌ Нужна активная подписка!", show_alert=True); return
-
-    cached_chats = await db_get_cached_chats(call.from_user.id)
-
-    if not cached_chats:
-        await call.message.edit_text(
-            "🔄 <b>Восстановление переписки</b>\n\n"
-            "❌ В кеше нет сохранённых чатов.\n\n"
-            "Бот кеширует сообщения пока подключён через Telegram Business "
-            "или состоит в группе. Если собеседник удалит чат — ты сможешь "
-            "его восстановить здесь.",
-            reply_markup=kb_back()
-        )
-        await call.answer()
-        return
-
-    buttons = []
-    for ch in cached_chats[:10]:  # максимум 10 кнопок
-        title = ch.get("chat_title") or f"Чат {ch['chat_id']}"
-        count = ch.get("msg_count", 0)
-        last  = (ch.get("last_date") or "")[:10]
-        buttons.append([InlineKeyboardButton(
-            text=f"💬 {title} ({count} сообщ.) · {last}",
-            callback_data=f"restore_chat_{ch['chat_id']}"
-        )])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
-
-    await call.message.edit_text(
-        f"🔄 <b>Восстановление переписки</b>\n\n"
-        f"Выбери чат который хочешь восстановить:\n"
-        f"<i>Найдено {len(cached_chats)} чатов в кеше</i>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await call.answer()
-
-@router.callback_query(F.data.startswith("restore_chat_"))
-async def cb_restore_chat(call: CallbackQuery, bot: Bot):
-    if not await is_subscribed(call.from_user.id):
-        await call.answer("❌ Нужна активная подписка!", show_alert=True); return
-
-    try:
-        chat_id = int(call.data.replace("restore_chat_", ""))
-    except ValueError:
-        await call.answer("❌ Ошибка", show_alert=True); return
-
-    user_id = call.from_user.id
-    msgs = await db_get_chat_history(user_id, chat_id)
-    if not msgs:
-        await call.answer("❌ Сообщения не найдены в кеше", show_alert=True); return
-
-    title = msgs[0].get("chat_title") or str(chat_id)
-
-    await call.message.edit_text(
-        f"⏳ Восстанавливаю переписку с <b>{title}</b>...\n"
-        f"Сообщений: <b>{len(msgs)}</b>"
-    )
-    await call.answer()
-
-    first_date = msgs[0]["date"].strftime("%d.%m.%Y")
-    last_date  = msgs[-1]["date"].strftime("%d.%m.%Y")
-    await bot.send_message(
-        user_id,
-        f"📂 ─────────────────────\n"
-        f"   <b>Восстановленный чат</b>\n"
-        f"   💬 {title}\n"
-        f"   📅 {first_date} — {last_date}\n"
-        f"   📨 {len(msgs)} сообщений\n"
-        f"─────────────────────"
-    )
-
-    sent = 0
-    prev_sender = None
-
-    for msg in msgs:
-        date_str   = msg["date"].strftime("%d.%m.%Y %H:%M")
-        sender     = msg.get("sender_name") or "Аноним"
-        text       = msg.get("text") or ""
-        media_type = msg.get("media_type")
-        file_id    = msg.get("file_id")
-
-        if sender != prev_sender:
-            prev_sender = sender
-            header = f"➤ <b>{sender}</b>  <i>{date_str}</i>"
-        else:
-            header = f"   <i>{date_str}</i>"
-
-        try:
-            if text and not media_type:
-                await bot.send_message(user_id, f"{header}\n{text}")
-            elif file_id and media_type:
-                caption_text = header + (f"\n{text}" if text else "")
-                await bot.send_message(user_id, caption_text)
-                await resend_media(bot, user_id, media_type, file_id)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            log.warning(f"restore send error: {e}")
-
-    await bot.send_message(
-        user_id,
-        f"✅ ─────────────────────\n"
-        f"   Переписка восстановлена\n"
-        f"   Отправлено: <b>{sent}</b> из <b>{len(msgs)}</b>\n"
-        f"─────────────────────",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Восстановить ещё", callback_data="restore_menu")],
-            [InlineKeyboardButton(text="🏠 Главное меню",     callback_data="back_main")],
-        ])
-    )
-
 # ── как это работает ───────────────────────────────────────
 
 @router.callback_query(F.data == "howto")
@@ -735,15 +631,12 @@ async def cb_howto(call: CallbackQuery):
         "<b>── Личная переписка (Telegram Business) ──</b>\n"
         "Нужен Telegram Premium.\n\n"
         "<b>Шаг 1.</b> @BotFather → твой бот → Bot Settings\n"
-        "→ Business Mode → Enable\n\n"
+        "→ Secretary Mode → Enable\n\n"
         "<b>Шаг 2.</b> Telegram → Настройки → Telegram Business\n"
-        "→ Чат-боты → введи @username бота\n\n"
+        "→ Автоматизация чатов (Чат-боты) → введи @username бота\n\n"
         "✅ Бот ловит удалённые и изменённые в личке.\n\n"
         "<b>── Группы ──</b>\n"
         "Добавь бота в группу как администратора.\n\n"
-        "<b>── Восстановление ──</b>\n"
-        "Кнопка 🔄 в меню — выбери чат и бот пришлёт всю сохранённую "
-        "переписку с ним в ЛС.\n\n"
         "<b>── Огонёк 🔥 ──</b>\n"
         "Заходи в бота каждый день — растёт серия.\n"
         "Пропустил день — серия сгорает!",
@@ -955,37 +848,309 @@ async def private_message_streak(message: Message, bot: Bot):
             )
 
 # ══════════════════════════════════════════════════════════
-#  АДМИН
+#  АДМИН-ПАНЕЛЬ  (доступна ТОЛЬКО пользователю с ADMIN_ID)
 # ══════════════════════════════════════════════════════════
 
-@router.message(Command("admin"), F.from_user.id == ADMIN_ID)
-async def cmd_admin(message: Message):
-    s = await db_stats()
-    await message.answer(
-        f"🔧 <b>Администратор</b>\n\n"
-        f"👥 Пользователей: <b>{s['users']}</b>\n"
-        f"💬 Групп: <b>{s['chats']}</b>\n"
-        f"📦 Кешировано: <b>{s['cached']}</b>\n"
-        f"✅ Подписок: <b>{s['active_subs']}</b>\n"
-        f"🎁 Триалов: <b>{s['trials']}</b>\n"
-        f"🏢 Business: <b>{s['business']}</b>\n"
-        f"👥 Рефералов: <b>{s['refs']}</b>"
-    )
+import html as _html
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
-@router.message(Command("broadcast"), F.from_user.id == ADMIN_ID)
-async def cmd_broadcast(message: Message, bot: Bot):
-    text = message.text.replace("/broadcast", "").strip()
-    if not text:
-        await message.answer("Использование: /broadcast Текст"); return
-    users = await db_all_ids()
-    ok = fail = 0
-    for uid in users:
+class AdminStates(StatesGroup):
+    give_id    = State()   # ждём ID для начисления дней
+    give_days  = State()   # ждём количество дней
+    all_days   = State()   # дни всем
+    find_user  = State()   # поиск пользователя
+    ban_id     = State()   # бан/разбан по ID
+    bcast_text = State()   # текст рассылки
+
+admin_router = Router(name="admin")
+# Фильтр на весь роутер: всё внутри работает только для ADMIN_ID
+admin_router.message.filter(F.from_user.id == ADMIN_ID)
+admin_router.callback_query.filter(F.from_user.id == ADMIN_ID)
+
+def kb_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика",         callback_data="adm_stats"),
+         InlineKeyboardButton(text="👤 Найти юзера",        callback_data="adm_find")],
+        [InlineKeyboardButton(text="➕ Начислить дни",      callback_data="adm_give"),
+         InlineKeyboardButton(text="🎁 Дни всем",           callback_data="adm_all")],
+        [InlineKeyboardButton(text="🚫 Бан / разбан",       callback_data="adm_ban"),
+         InlineKeyboardButton(text="🏆 Топ рефералов",      callback_data="adm_top")],
+        [InlineKeyboardButton(text="📢 Рассылка",           callback_data="adm_bcast"),
+         InlineKeyboardButton(text="🆕 Новые юзеры",        callback_data="adm_new")],
+    ])
+
+def kb_admin_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ В админ-панель", callback_data="adm_menu")]
+    ])
+
+def _parse_int(text: str) -> Optional[int]:
+    try:
+        return int((text or "").strip().replace("+", ""))
+    except ValueError:
+        return None
+
+async def _user_card(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    u = await db_get_user(uid)
+    if not u:
+        return "❌ Пользователь не найден (он должен был хотя бы раз нажать /start).", kb_admin_back()
+    now    = datetime.utcnow()
+    refs   = await db_ref_count(uid)
+    chats  = await db_user_chats(uid)
+    bc     = await db_get_user_bc(uid)
+    banned = await db_is_banned(uid)
+    if u.get("sub_until") and u["sub_until"] > now:
+        sub = f"✅ до {u['sub_until'].strftime('%d.%m.%Y %H:%M')} ({(u['sub_until'] - now).days} дн.)"
+    elif u.get("trial_start") and now < u["trial_start"] + timedelta(days=TRIAL_DAYS):
+        sub = f"🎁 пробный до {(u['trial_start'] + timedelta(days=TRIAL_DAYS)).strftime('%d.%m.%Y')}"
+    else:
+        sub = "❌ нет"
+    text = (
+        f"👤 <b>{_html.escape(u.get('name') or '—')}</b>\n"
+        f"ID: <code>{uid}</code>\n"
+        f"Подписка: {sub}\n"
+        f"Business: {'🟢' if bc else '🔴'}\n"
+        f"Групп: {len(chats)} · Рефералов: {refs}\n"
+        f"Серия: {u.get('streak') or 0} дн.\n"
+        f"Регистрация: {str(u.get('created_at'))[:16]}\n"
+        f"Статус: {'🚫 ЗАБАНЕН' if banned else 'активен'}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Начислить дни",  callback_data=f"adm_ugive_{uid}")],
+        [InlineKeyboardButton(text="✅ Разбанить" if banned else "🚫 Забанить",
+                              callback_data=f"adm_uban_{uid}"),
+         InlineKeyboardButton(text="❌ Забрать подписку", callback_data=f"adm_urevoke_{uid}")],
+        [InlineKeyboardButton(text="◀️ В админ-панель", callback_data="adm_menu")],
+    ])
+    return text, kb
+
+# ── вход ───────────────────────────────────────────────────
+
+@admin_router.message(Command("admin"))
+async def cmd_admin(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("🛠 <b>Админ-панель</b>\n\nВыбери действие:", reply_markup=kb_admin())
+
+@admin_router.callback_query(F.data == "adm_menu")
+async def adm_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("🛠 <b>Админ-панель</b>\n\nВыбери действие:", reply_markup=kb_admin())
+    await call.answer()
+
+# Быстрая команда: /give <id> <дни>   (дни могут быть отрицательными)
+@admin_router.message(Command("give"))
+async def cmd_give(message: Message, bot: Bot):
+    parts = (message.text or "").split()
+    uid  = _parse_int(parts[1]) if len(parts) > 1 else None
+    days = _parse_int(parts[2]) if len(parts) > 2 else None
+    if uid is None or days is None:
+        await message.answer("Использование: <code>/give ID ДНИ</code>"); return
+    await message.answer(await _apply_days(bot, uid, days))
+
+async def _apply_days(bot: Bot, uid: int, days: int) -> str:
+    if not await db_get_user(uid):
+        return "❌ Пользователь не найден (он должен нажать /start в боте)."
+    await db_add_days(uid, days)
+    u = await db_get_user(uid)
+    until = u["sub_until"].strftime("%d.%m.%Y %H:%M") if u.get("sub_until") else "—"
+    try:
+        if days > 0:
+            await bot.send_message(uid, f"🎁 Администратор начислил тебе <b>+{days} дн.</b> подписки!")
+    except Exception:
+        pass
+    return f"✅ Пользователю <code>{uid}</code> изменено дней: <b>{days:+d}</b>\nПодписка до: <b>{until}</b>"
+
+# ── статистика ─────────────────────────────────────────────
+
+@admin_router.callback_query(F.data == "adm_stats")
+async def adm_stats(call: CallbackQuery):
+    s = await db_stats()
+    async with _db.execute("SELECT COUNT(*) FROM banned") as c:
+        banned = (await c.fetchone())[0]
+    await call.message.edit_text(
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{s['users']}</b>\n"
+        f"✅ Активных подписок: <b>{s['active_subs']}</b>\n"
+        f"🎁 На триале: <b>{s['trials']}</b>\n"
+        f"🏢 Business-подключений: <b>{s['business']}</b>\n"
+        f"💬 Групп: <b>{s['chats']}</b>\n"
+        f"📦 Сообщений в кеше: <b>{s['cached']}</b>\n"
+        f"👥 Рефералов всего: <b>{s['refs']}</b>\n"
+        f"🚫 Забанено: <b>{banned}</b>",
+        reply_markup=kb_admin_back())
+    await call.answer()
+
+# ── начислить дни ──────────────────────────────────────────
+
+@admin_router.callback_query(F.data == "adm_give")
+async def adm_give(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.give_id)
+    await call.message.edit_text(
+        "➕ <b>Начисление дней</b>\n\nОтправь <b>ID пользователя</b> (число).\n"
+        "ID можно посмотреть в «Найти юзера» или в профиле пользователя.",
+        reply_markup=kb_admin_back())
+    await call.answer()
+
+@admin_router.message(AdminStates.give_id, F.text)
+async def adm_give_id(message: Message, state: FSMContext):
+    uid = _parse_int(message.text)
+    if uid is None or not await db_get_user(uid):
+        await message.answer("❌ Пользователь не найден. Отправь корректный ID или вернись в панель.",
+                             reply_markup=kb_admin_back()); return
+    await state.update_data(target=uid)
+    await state.set_state(AdminStates.give_days)
+    await message.answer(f"Сколько дней начислить <code>{uid}</code>?\n"
+                         "Любое число. Отрицательное — списать дни (например <code>-5</code>).",
+                         reply_markup=kb_admin_back())
+
+@admin_router.message(AdminStates.give_days, F.text)
+async def adm_give_days(message: Message, state: FSMContext, bot: Bot):
+    days = _parse_int(message.text)
+    if days is None:
+        await message.answer("❌ Нужно целое число.", reply_markup=kb_admin_back()); return
+    uid = (await state.get_data()).get("target")
+    await state.clear()
+    await message.answer(await _apply_days(bot, uid, days), reply_markup=kb_admin())
+
+@admin_router.callback_query(F.data.startswith("adm_ugive_"))
+async def adm_ugive(call: CallbackQuery, state: FSMContext):
+    uid = int(call.data.replace("adm_ugive_", ""))
+    await state.update_data(target=uid)
+    await state.set_state(AdminStates.give_days)
+    await call.message.answer(f"Сколько дней начислить <code>{uid}</code>? (можно отрицательное)",
+                              reply_markup=kb_admin_back())
+    await call.answer()
+
+# ── дни всем ───────────────────────────────────────────────
+
+@admin_router.callback_query(F.data == "adm_all")
+async def adm_all(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.all_days)
+    await call.message.edit_text(
+        "🎁 <b>Дни всем пользователям</b>\n\nСколько дней начислить КАЖДОМУ пользователю?\n"
+        "Отправь число (например <code>3</code>).",
+        reply_markup=kb_admin_back())
+    await call.answer()
+
+@admin_router.message(AdminStates.all_days, F.text)
+async def adm_all_days(message: Message, state: FSMContext, bot: Bot):
+    days = _parse_int(message.text)
+    if days is None or days <= 0:
+        await message.answer("❌ Нужно положительное целое число.", reply_markup=kb_admin_back()); return
+    await state.clear()
+    ids = await db_all_ids()
+    ok = 0
+    for uid in ids:
+        if await db_is_banned(uid):
+            continue
+        await db_add_days(uid, days)
         try:
-            await bot.send_message(uid, text); ok += 1
+            await bot.send_message(uid, f"🎁 Всем пользователям начислено <b>+{days} дн.</b> подписки!")
+        except Exception:
+            pass
+        ok += 1
+        await asyncio.sleep(0.05)
+    await message.answer(f"✅ Начислено <b>+{days} дн.</b> пользователям: <b>{ok}</b>", reply_markup=kb_admin())
+
+# ── поиск пользователя ─────────────────────────────────────
+
+@admin_router.callback_query(F.data == "adm_find")
+async def adm_find(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.find_user)
+    await call.message.edit_text("👤 Отправь <b>ID</b> пользователя.", reply_markup=kb_admin_back())
+    await call.answer()
+
+@admin_router.message(AdminStates.find_user, F.text)
+async def adm_find_id(message: Message, state: FSMContext):
+    uid = _parse_int(message.text)
+    if uid is None:
+        await message.answer("❌ Нужен числовой ID.", reply_markup=kb_admin_back()); return
+    await state.clear()
+    text, kb = await _user_card(uid)
+    await message.answer(text, reply_markup=kb)
+
+@admin_router.callback_query(F.data.startswith("adm_uban_"))
+async def adm_uban(call: CallbackQuery):
+    uid = int(call.data.replace("adm_uban_", ""))
+    await db_set_ban(uid, not await db_is_banned(uid))
+    text, kb = await _user_card(uid)
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer("Готово")
+
+@admin_router.callback_query(F.data.startswith("adm_urevoke_"))
+async def adm_urevoke(call: CallbackQuery):
+    uid = int(call.data.replace("adm_urevoke_", ""))
+    await db_revoke_sub(uid)
+    text, kb = await _user_card(uid)
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer("Подписка забрана")
+
+# ── бан / разбан по ID ─────────────────────────────────────
+
+@admin_router.callback_query(F.data == "adm_ban")
+async def adm_ban(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.ban_id)
+    await call.message.edit_text("🚫 Отправь <b>ID</b> пользователя — переключу бан/разбан.",
+                                 reply_markup=kb_admin_back())
+    await call.answer()
+
+@admin_router.message(AdminStates.ban_id, F.text)
+async def adm_ban_id(message: Message, state: FSMContext):
+    uid = _parse_int(message.text)
+    if uid is None:
+        await message.answer("❌ Нужен числовой ID.", reply_markup=kb_admin_back()); return
+    if uid == ADMIN_ID:
+        await message.answer("❌ Себя банить нельзя.", reply_markup=kb_admin_back()); return
+    await state.clear()
+    now_banned = not await db_is_banned(uid)
+    await db_set_ban(uid, now_banned)
+    await message.answer(f"{'🚫 Забанен' if now_banned else '✅ Разбанен'}: <code>{uid}</code>",
+                         reply_markup=kb_admin())
+
+# ── топ рефералов / новые юзеры ────────────────────────────
+
+@admin_router.callback_query(F.data == "adm_top")
+async def adm_top(call: CallbackQuery):
+    rows = await db_top_referrers(10)
+    if not rows:
+        text = "🏆 <b>Топ рефералов</b>\n\nПока никто никого не пригласил."
+    else:
+        lines = [f"{i}. {_html.escape(r.get('name') or '—')} (<code>{r['user_id']}</code>) — <b>{r['cnt']}</b>"
+                 for i, r in enumerate(rows, 1)]
+        text = "🏆 <b>Топ рефералов</b>\n\n" + "\n".join(lines)
+    await call.message.edit_text(text, reply_markup=kb_admin_back())
+    await call.answer()
+
+@admin_router.callback_query(F.data == "adm_new")
+async def adm_new(call: CallbackQuery):
+    rows = await db_recent_users(10)
+    lines = [f"• {_html.escape(r.get('name') or '—')} (<code>{r['user_id']}</code>) · {str(r['created_at'])[:16]}"
+             for r in rows] or ["Пока никого."]
+    await call.message.edit_text("🆕 <b>Последние пользователи</b>\n\n" + "\n".join(lines),
+                                 reply_markup=kb_admin_back())
+    await call.answer()
+
+# ── рассылка ───────────────────────────────────────────────
+
+@admin_router.callback_query(F.data == "adm_bcast")
+async def adm_bcast(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.bcast_text)
+    await call.message.edit_text("📢 Отправь текст рассылки — он уйдёт всем пользователям.",
+                                 reply_markup=kb_admin_back())
+    await call.answer()
+
+@admin_router.message(AdminStates.bcast_text, F.text)
+async def adm_bcast_text(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    ok = fail = 0
+    for uid in await db_all_ids():
+        try:
+            await bot.send_message(uid, message.text); ok += 1
             await asyncio.sleep(0.05)
         except Exception:
             fail += 1
-    await message.answer(f"📢 Рассылка: ✅{ok} / ❌{fail}")
+    await message.answer(f"📢 Рассылка завершена: ✅ {ok} / ❌ {fail}", reply_markup=kb_admin())
 
 # ══════════════════════════════════════════════════════════
 #  ЗАПУСК
@@ -995,13 +1160,14 @@ async def main():
     await db_init()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp  = Dispatcher(storage=MemoryStorage())
+    dp.include_router(admin_router)
     dp.include_router(router)
 
     print("\n" + "="*50)
     print("  ✅ SpyBot запущен!")
     print("  🏢 Режим: Telegram Business API")
     print("  🔥 Реферальная программа: активна")
-    print("  🔄 Восстановление чатов: активно")
+    print("  🛠  Админ-панель: /admin")
     print(f"  🗄  База данных: {DB_PATH}")
     print("  💬 Напиши боту /start в Telegram")
     print("="*50 + "\n")
