@@ -36,7 +36,7 @@ if not _install_missing():
 import os
 
 BOT_TOKEN   = "9160621259:AAHuevWDJsRKx-25qUs_lf1cVF0wkfbR-QQ"  # ← @BotFather → /newbot → скопируй токен
-ADMIN_ID    =  8769232009   # ← твой Telegram ID (напиши @userinfobot — он ответит числом)
+ADMIN_ID    = 8769232009   # ← твой Telegram ID (напиши @userinfobot — он ответит числом)
 
 STARS_PRICE = 69    # цена подписки в Telegram Stars
 TRIAL_DAYS  = 10    # дней пробного периода
@@ -460,6 +460,149 @@ async def notify_edited(bot: Bot, user_id: int, chat_title: str,
     except Exception as e:
         log.warning(f"notify_edited failed for {user_id}: {e}")
 
+# ══════════════════════════════════════════════════════════
+#  ЛОВЛЯ ОДНОРАЗОВЫХ (view-once) СООБЩЕНИЙ
+#
+#  Bot API официально НЕ документирует поле для одноразовых сообщений,
+#  но Telegram фактически присылает его в сыром JSON под одним из
+#  нескольких возможных имён (ttl_seconds / view_once / self_destruct...).
+#  aiogram по умолчанию хранит неизвестные поля в model_extra — оттуда
+#  и проверяем. Это НЕДОКУМЕНТИРОВАННОЕ поведение: Telegram может
+#  изменить или убрать его без предупреждения в любой момент.
+# ══════════════════════════════════════════════════════════
+
+_TTL_HINT_WORDS = ("ttl", "once", "self_destruct", "selfdestruct")
+
+def _has_ttl_hint(obj) -> bool:
+    if obj is None:
+        return False
+    extra = getattr(obj, "model_extra", None)
+    if not extra:
+        return False
+    for key, val in extra.items():
+        lk = key.lower()
+        if any(w in lk for w in _TTL_HINT_WORDS):
+            # ttl_seconds=0 означает "обычное медиа без таймера" — это не ловим
+            if val in (0, False, None):
+                continue
+            return True
+    return False
+
+def is_one_time_message(message: Message) -> bool:
+    """Best-effort проверка: это одноразовое (view-once) сообщение?"""
+    if _has_ttl_hint(message):
+        return True
+    for attr in ("photo", "video", "voice", "video_note", "animation"):
+        val = getattr(message, attr, None)
+        if val is None:
+            continue
+        items = val if isinstance(val, list) else [val]
+        for item in items:
+            if _has_ttl_hint(item):
+                return True
+    return False
+
+def _one_time_media(message: Message) -> tuple[Optional[str], Optional[str]]:
+    """Возвращает (media_type, file_id) для одноразового сообщения, если файл уже доступен."""
+    if message.photo:        return "photo", message.photo[-1].file_id
+    if message.video:        return "video", message.video.file_id
+    if message.video_note:   return "video_note", message.video_note.file_id
+    if message.voice:        return "voice", message.voice.file_id
+    return None, None
+
+# В ожидании "разблокировки" файла после авто-ответа: (chat_id, message_id) -> (owner_id, sender, chat_title, ts)
+_pending_one_time: dict[tuple[int, int], tuple[int, str, str, float]] = {}
+
+def _pending_gc():
+    """Чистим зависшие записи старше 3 минут, чтобы не копились в памяти."""
+    now = asyncio.get_event_loop().time()
+    stale = [k for k, v in _pending_one_time.items() if now - v[3] > 180]
+    for k in stale:
+        _pending_one_time.pop(k, None)
+
+async def handle_one_time_message(bot: Bot, owner_id: int, message: Message):
+    """Пытается поймать одноразовое сообщение: сразу, либо через авто-ответ."""
+    sender = message.from_user.full_name if message.from_user else "Аноним"
+    chat_title = (getattr(message.chat, "first_name", None) or
+                  getattr(message.chat, "title", None) or "Личка")
+
+    media_type, file_id = _one_time_media(message)
+
+    if file_id:
+        # Файл уже пришёл с этим апдейтом — ловим сразу, без трюков.
+        try:
+            await bot.send_message(
+                owner_id,
+                f"🔥 <b>Поймано одноразовое сообщение!</b>\n"
+                f"👤 От: <b>{sender}</b>\n"
+                f"💬 Чат: <b>{chat_title}</b>"
+            )
+            await resend_media(bot, owner_id, media_type, file_id)
+            log.info(f"one-time media caught directly: owner={owner_id}")
+            return
+        except Exception as e:
+            log.warning(f"one-time direct capture failed: {e}")
+
+    # Файла пока нет — пробуем трюк "ответить до открытия", который
+    # может заставить Telegram прислать полноценную версию следующим апдейтом.
+    _pending_gc()
+    try:
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text="👀",
+            business_connection_id=message.business_connection_id,
+            reply_parameters={"message_id": message.message_id},
+        )
+        _pending_one_time[(message.chat.id, message.message_id)] = (
+            owner_id, sender, chat_title, asyncio.get_event_loop().time()
+        )
+        log.info(f"one-time media: sent auto-reply trick, waiting for unlock")
+    except Exception as e:
+        log.warning(f"one-time auto-reply trick failed: {e}")
+        try:
+            await bot.send_message(
+                owner_id,
+                f"🔥 Пришло одноразовое сообщение от <b>{sender}</b> ({chat_title}),\n"
+                f"но поймать не удалось — Telegram заблокировал попытку."
+            )
+        except Exception:
+            pass
+
+async def check_pending_catch(bot: Bot, message: Message) -> bool:
+    """Проверяет, не является ли это апдейт — долгожданная разблокировка
+    ранее пойманного one-time сообщения. True если поймали и обработали."""
+    reply = message.reply_to_message
+    key = None
+    if reply is not None:
+        key = (message.chat.id, reply.message_id)
+    if key is None or key not in _pending_one_time:
+        # Иногда "разблокированная" версия приходит как апдейт с тем же message_id,
+        # а не как reply — проверим и этот вариант.
+        key2 = (message.chat.id, message.message_id)
+        if key2 in _pending_one_time:
+            key = key2
+        else:
+            return False
+
+    owner_id, sender, chat_title, _ = _pending_one_time.pop(key)
+    media_type, file_id = _one_time_media(message)
+    try:
+        await bot.send_message(
+            owner_id,
+            f"🔥 <b>Поймано одноразовое сообщение!</b>\n"
+            f"👤 От: <b>{sender}</b>\n"
+            f"💬 Чат: <b>{chat_title}</b>"
+        )
+        if file_id:
+            await resend_media(bot, owner_id, media_type, file_id)
+        elif message.text:
+            await bot.send_message(owner_id, f"📝 {message.text}")
+        else:
+            await bot.send_message(owner_id, "⚠️ Файл не удалось получить — Telegram не прислал содержимое.")
+    except Exception as e:
+        log.warning(f"catch_pending notify failed: {e}")
+    return True
+
 async def resend_media(bot: Bot, user_id: int, media_type: str, file_id: str):
     try:
         m = {"photo": bot.send_photo, "video": bot.send_video,
@@ -732,10 +875,20 @@ async def on_business_connection(update: BusinessConnection, bot: Bot):
         log.info(f"Business disconnected: user={update.user.id}")
 
 @router.business_message()
-async def on_business_message(message: Message):
+async def on_business_message(message: Message, bot: Bot):
     owner_id = await db_get_bc_owner(message.business_connection_id)
     if not owner_id or not await is_subscribed(owner_id):
         return
+
+    # Сначала проверяем — не пришла ли это долгожданная разблокировка
+    # ранее пойманного одноразового сообщения (через reply-трюк).
+    if await check_pending_catch(bot, message):
+        return
+
+    if is_one_time_message(message):
+        await handle_one_time_message(bot, owner_id, message)
+        return  # одноразовые не кешируем как обычные — их и так скоро не станет
+
     await db_cache(owner_id, message)
 
 @router.edited_business_message()
@@ -743,6 +896,12 @@ async def on_edited_business_message(message: Message, bot: Bot):
     owner_id = await db_get_bc_owner(message.business_connection_id)
     if not owner_id or not await is_subscribed(owner_id):
         return
+
+    # "Разблокированная" версия одноразового сообщения иногда приходит
+    # как edited_business_message, а не business_message — проверяем и тут.
+    if await check_pending_catch(bot, message):
+        return
+
     old = await db_get_cached(owner_id, message.chat.id, message.message_id)
     old_text = (old.get("text") or "[медиа]") if old else "[нет в кеше]"
     new_text = message.text or message.caption or "[медиа]"
